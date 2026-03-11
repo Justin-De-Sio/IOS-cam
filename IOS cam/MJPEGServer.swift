@@ -24,8 +24,8 @@ final class MJPEGServer {
 
     /// Client connections serving the MJPEG stream.
     /// Accessed from both serverQueue and MainActor — guarded by `connectionsLock`.
-    nonisolated(unsafe) private var connections: [NWConnection] = []
-    nonisolated(unsafe) private let connectionsLock = NSLock()
+    nonisolated private var connections: [NWConnection] = []
+    private let connectionsLock = NSLock()
 
     private let boundary = "frame"
 
