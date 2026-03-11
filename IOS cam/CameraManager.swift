@@ -19,7 +19,7 @@ final class CameraManager: NSObject {
     var latestFrame: Data?
 
     /// Direct callback for frame delivery — called on the capture queue.
-    nonisolated(unsafe) var onFrameCaptured: ((Data) -> Void)?
+    nonisolated var onFrameCaptured: (@Sendable (Data) -> Void)?
 
     /// JPEG compression quality (0.1 – 1.0). Default 0.6.
     var jpegQuality: CGFloat = 0.6 {
@@ -172,7 +172,7 @@ final class CameraManager: NSObject {
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
-extension CameraManager: @preconcurrency AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     nonisolated func captureOutput(
         _ output: AVCaptureOutput,
@@ -186,7 +186,7 @@ extension CameraManager: @preconcurrency AVCaptureVideoDataOutputSampleBufferDel
         guard let jpegData = ciContext.jpegRepresentation(
             of: ciImage,
             colorSpace: CGColorSpaceCreateDeviceRGB(),
-            options: [kCGImageDestinationLossyCompressionQuality: quality]
+            options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality]
         ) else { return }
 
         onFrameCaptured?(jpegData)
