@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import QuartzCore
 
 @Observable
 final class StreamServer {
@@ -77,18 +78,39 @@ final class StreamServer {
 
     // MARK: - Broadcasting
 
+    @ObservationIgnored nonisolated(unsafe) private var sendTimesMs: [Double] = []
+    @ObservationIgnored nonisolated(unsafe) private var lastSendLog = CACurrentMediaTime()
+
     nonisolated func broadcast(data: Data) {
+        let queueStart = CACurrentMediaTime()
         queue.async { [weak self] in
             guard let self else { return }
+            let dispatchMs = (CACurrentMediaTime() - queueStart) * 1000.0
+            if dispatchMs > 1.0 {
+                print(String(format: "[Timing] queue dispatch: %.1fms", dispatchMs))
+            }
+
             self.lock.lock()
             let clients = self.connections
             self.lock.unlock()
 
             for conn in clients {
                 let id = ObjectIdentifier(conn)
+                let sendStart = CACurrentMediaTime()
                 conn.send(content: data, contentContext: .defaultMessage, isComplete: false,
                           completion: .contentProcessed { [weak self] error in
+                    let sendMs = (CACurrentMediaTime() - sendStart) * 1000.0
                     guard let self else { return }
+                    self.sendTimesMs.append(sendMs)
+                    let now = CACurrentMediaTime()
+                    if now - self.lastSendLog >= 2.0 {
+                        let avg = self.sendTimesMs.reduce(0, +) / Double(self.sendTimesMs.count)
+                        let max = self.sendTimesMs.max() ?? 0
+                        print(String(format: "[Timing] TCP send: avg=%.1fms max=%.1fms frames=%d",
+                                     avg, max, self.sendTimesMs.count))
+                        self.sendTimesMs.removeAll()
+                        self.lastSendLog = now
+                    }
                     if let error {
                         self.lock.lock()
                         let count = (self.droppedFrames[id] ?? 0) + 1

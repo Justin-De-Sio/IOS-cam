@@ -1,7 +1,7 @@
 import AVFoundation
 import VideoToolbox
 import UIKit
-import os
+import QuartzCore
 
 // MARK: - Stream Profile
 
@@ -65,6 +65,10 @@ final class CameraManager: NSObject {
 
     /// Callback: delivers H.264 Annex-B data chunks on captureQueue.
     @ObservationIgnored nonisolated(unsafe) var onH264Data: ((Data) -> Void)?
+
+    /// Frame timing stats (printed every 2s)
+    @ObservationIgnored nonisolated(unsafe) private var encodeTimesMs: [Double] = []
+    @ObservationIgnored nonisolated(unsafe) private var lastTimingLog = CACurrentMediaTime()
 
     /// Latest SPS/PPS to send to newly connected clients.
     @ObservationIgnored nonisolated(unsafe) var latestParamSets: Data?
@@ -315,13 +319,38 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
         }
 
+        let captureTime = CACurrentMediaTime()
+
         var flags = VTEncodeInfoFlags()
         VTCompressionSessionEncodeFrame(enc, imageBuffer: px,
             presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sb),
             duration: .invalid, frameProperties: props, infoFlagsOut: &flags
         ) { [self] status, _, buf in
             guard status == noErr, let buf, let data = annexB(from: buf) else { return }
-            onH264Data?(data)
+
+            let encodeEnd = CACurrentMediaTime()
+            let encodeMs = (encodeEnd - captureTime) * 1000.0
+
+            // Prepend 8-byte timestamp header (microseconds since epoch)
+            let nowUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+            var header = Data(count: 8)
+            header.withUnsafeMutableBytes { ptr in
+                ptr.storeBytes(of: nowUs.bigEndian, as: UInt64.self)
+            }
+            var framedData = header
+            framedData.append(data)
+
+            encodeTimesMs.append(encodeMs)
+            if encodeEnd - lastTimingLog >= 2.0 {
+                let avg = encodeTimesMs.reduce(0, +) / Double(encodeTimesMs.count)
+                let max = encodeTimesMs.max() ?? 0
+                print(String(format: "[Timing] encode: avg=%.1fms max=%.1fms frames=%d size=%dB",
+                             avg, max, encodeTimesMs.count, data.count))
+                encodeTimesMs.removeAll()
+                lastTimingLog = encodeEnd
+            }
+
+            onH264Data?(framedData)
         }
     }
 }

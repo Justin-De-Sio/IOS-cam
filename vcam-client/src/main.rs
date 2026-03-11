@@ -293,14 +293,84 @@ fn stream_raw(
     last_report: &mut Instant,
 ) -> Result<()> {
     let mut buf = vec![0u8; 8 * 1024];
+    let mut frame_count: u64 = 0;
+    let mut inter_frame_times: Vec<f64> = Vec::new();
+    let mut recv_sizes: Vec<usize> = Vec::new();
+    let mut last_recv = Instant::now();
+    let mut last_timing_log = Instant::now();
+
+    // NAL start code to detect frame boundaries
+    let nal_start: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+    // 8-byte timestamp header from iOS
+    let mut pending_timestamp: Option<u64> = None;
+    let mut network_delays: Vec<f64> = Vec::new();
 
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             return Ok(());
         }
-        writer.write_all(&buf[..n])?;
-        *bytes_total += n as u64;
+
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+
+        // Check for 8-byte timestamp header before NAL start code
+        // Format: [8 bytes big-endian microseconds][0x00 0x00 0x00 0x01 ...]
+        if n >= 12 && buf[8..12] == nal_start {
+            let ts = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+            if ts > 1_000_000_000_000_000 && ts < now_us + 60_000_000 {
+                // Valid timestamp — measure clock-relative delay
+                // Note: clocks aren't synced, so we track drift/jitter, not absolute
+                pending_timestamp = Some(ts);
+                let delay_ms = if now_us > ts {
+                    (now_us - ts) as f64 / 1000.0
+                } else {
+                    0.0
+                };
+                network_delays.push(delay_ms);
+
+                // Strip the 8-byte header, pass only H.264 to ffmpeg
+                writer.write_all(&buf[8..n])?;
+                *bytes_total += (n - 8) as u64;
+            } else {
+                writer.write_all(&buf[..n])?;
+                *bytes_total += n as u64;
+            }
+        } else {
+            writer.write_all(&buf[..n])?;
+            *bytes_total += n as u64;
+        }
+
+        // Track inter-receive timing
+        let inter = last_recv.elapsed().as_secs_f64() * 1000.0;
+        inter_frame_times.push(inter);
+        recv_sizes.push(n);
+        last_recv = Instant::now();
+        frame_count += 1;
+
+        // Log timing stats every 2s
+        if last_timing_log.elapsed() >= Duration::from_secs(2) {
+            let avg_inter = inter_frame_times.iter().sum::<f64>() / inter_frame_times.len() as f64;
+            let max_inter = inter_frame_times.iter().cloned().fold(0.0f64, f64::max);
+            let avg_size = recv_sizes.iter().sum::<usize>() / recv_sizes.len();
+
+            eprint!("[Timing] recv: avg={avg_inter:.1}ms max={max_inter:.1}ms avg_size={avg_size}B reads={}", recv_sizes.len());
+
+            if !network_delays.is_empty() {
+                let avg_net = network_delays.iter().sum::<f64>() / network_delays.len() as f64;
+                let min_net = network_delays.iter().cloned().fold(f64::MAX, f64::min);
+                eprint!(" | clock_delta: avg={avg_net:.0}ms min={min_net:.0}ms");
+            }
+            eprintln!();
+
+            inter_frame_times.clear();
+            recv_sizes.clear();
+            network_delays.clear();
+            last_timing_log = Instant::now();
+        }
+
         report_stats(*bytes_total, start, last_report);
     }
 }
