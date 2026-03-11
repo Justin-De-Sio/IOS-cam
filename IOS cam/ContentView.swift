@@ -65,7 +65,7 @@ struct ContentView: View {
                     }
 
                     // Controls row
-                    HStack(spacing: 20) {
+                    HStack(spacing: 16) {
                         // Camera flip
                         Button {
                             camera.toggleCamera()
@@ -77,25 +77,43 @@ struct ContentView: View {
                                 .background(.ultraThinMaterial, in: Circle())
                         }
 
-                        // Start / Stop
+                        // ON / OFF toggle
                         Button {
-                            if server.isRunning {
-                                server.stop()
-                                camera.stop()
-                                camera.onH264Data = nil
-                                UIApplication.shared.isIdleTimerDisabled = false
-                            } else {
-                                camera.onH264Data = { [server] h264Data in
-                                    server.broadcast(data: h264Data)
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if server.isRunning {
+                                    server.stop()
+                                    camera.stop()
+                                    camera.onH264Data = nil
+                                    UIApplication.shared.isIdleTimerDisabled = false
+                                } else {
+                                    camera.onH264Data = { [server] h264Data in
+                                        server.broadcast(data: h264Data)
+                                    }
+                                    camera.start()
+                                    server.start()
+                                    UIApplication.shared.isIdleTimerDisabled = true
                                 }
-                                camera.start()
-                                server.start()
-                                UIApplication.shared.isIdleTimerDisabled = true
                             }
                         } label: {
-                            Image(systemName: server.isRunning ? "stop.circle.fill" : "play.circle.fill")
-                                .font(.system(size: 50))
-                                .foregroundStyle(server.isRunning ? .red : .green)
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(server.isRunning ? .green : .red.opacity(0.5))
+                                    .frame(width: 12, height: 12)
+                                    .shadow(color: server.isRunning ? .green : .clear, radius: 4)
+                                Text(server.isRunning ? "ON" : "OFF")
+                                    .font(.title3.bold().monospaced())
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                            .background(
+                                server.isRunning ? Color.green.opacity(0.3) : Color.red.opacity(0.15),
+                                in: Capsule()
+                            )
+                            .overlay(
+                                Capsule()
+                                    .stroke(server.isRunning ? .green.opacity(0.6) : .red.opacity(0.3), lineWidth: 1.5)
+                            )
                         }
                     }
                 }
