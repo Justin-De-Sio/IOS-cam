@@ -100,7 +100,7 @@ final class MJPEGServer {
     // MARK: - Broadcasting
 
     /// Push a JPEG frame to all connected MJPEG clients.
-    /// Called from MainActor (via onChange in ContentView); dispatches to serverQueue.
+    /// Safe to call from any queue; dispatches to serverQueue internally.
     func broadcast(jpegData: Data) {
         let framePayload = buildFramePayload(jpegData: jpegData)
 

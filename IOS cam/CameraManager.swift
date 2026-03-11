@@ -7,7 +7,7 @@
 
 import AVFoundation
 import CoreImage
-import UIKit
+import os
 
 @Observable
 final class CameraManager: NSObject {
@@ -18,12 +18,15 @@ final class CameraManager: NSObject {
     var currentPosition: AVCaptureDevice.Position = .back
     var latestFrame: Data?
 
+    /// Direct callback for frame delivery — called on the capture queue.
+    nonisolated(unsafe) var onFrameCaptured: ((Data) -> Void)?
+
     /// JPEG compression quality (0.1 – 1.0). Default 0.6.
     var jpegQuality: CGFloat = 0.6 {
         didSet {
             let clamped = min(max(jpegQuality, 0.1), 1.0)
             if jpegQuality != clamped { jpegQuality = clamped }
-            _captureQuality = clamped
+            _captureQuality.withLock { $0 = clamped }
         }
     }
 
@@ -36,26 +39,21 @@ final class CameraManager: NSObject {
     private let captureQueue = DispatchQueue(label: "com.linuxcam.capture", qos: .userInteractive)
     private let ciContext = CIContext()
 
-    /// Mirror of `jpegQuality` that is safe to read from the capture queue.
-    /// Updated on every `jpegQuality` didSet so we never touch MainActor state
-    /// from the delegate callback.
-    nonisolated(unsafe) private var _captureQuality: CGFloat = 0.6
+    /// Thread-safe mirror of `jpegQuality` for use on the capture queue.
+    private let _captureQuality = OSAllocatedUnfairLock(initialState: CGFloat(0.6))
 
     private var currentResolution: AVCaptureSession.Preset = .hd1920x1080
 
     // MARK: - Lifecycle
 
-    override init() {
-        super.init()
-        _captureQuality = jpegQuality
-    }
-
     /// Start the capture session on the dedicated queue.
     func start() {
         guard !isRunning else { return }
+        let position = currentPosition
+        let resolution = currentResolution
         captureQueue.async { [weak self] in
             guard let self else { return }
-            self.configureCaptureSession()
+            self.configureCaptureSession(position: position, resolution: resolution)
             self.session.startRunning()
             Task { @MainActor [weak self] in
                 self?.isRunning = true
@@ -78,9 +76,10 @@ final class CameraManager: NSObject {
     /// Toggle between front and back camera.
     func toggleCamera() {
         currentPosition = (currentPosition == .back) ? .front : .back
+        let position = currentPosition
+        let resolution = currentResolution
         captureQueue.async { [weak self] in
-            guard let self else { return }
-            self.reconfigureCamera()
+            self?.reconfigureCamera(position: position, resolution: resolution)
         }
     }
 
@@ -88,21 +87,22 @@ final class CameraManager: NSObject {
     func setResolution(_ preset: AVCaptureSession.Preset) {
         guard preset == .hd1920x1080 || preset == .hd4K3840x2160 else { return }
         currentResolution = preset
+        let position = currentPosition
+        let resolution = preset
         captureQueue.async { [weak self] in
-            guard let self else { return }
-            self.reconfigureCamera()
+            self?.reconfigureCamera(position: position, resolution: resolution)
         }
     }
 
     // MARK: - Session Configuration
 
     /// Full initial configuration — called once from `start()`.
-    private func configureCaptureSession() {
+    private func configureCaptureSession(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset) {
         session.beginConfiguration()
-        session.sessionPreset = currentResolution
+        session.sessionPreset = resolution
 
         // Add input
-        if let device = cameraDevice(for: currentPosition),
+        if let device = cameraDevice(for: position),
            let input = try? AVCaptureDeviceInput(device: device) {
             if session.canAddInput(input) {
                 session.addInput(input)
@@ -125,9 +125,9 @@ final class CameraManager: NSObject {
     }
 
     /// Reconfigure input after camera toggle or resolution change.
-    private func reconfigureCamera() {
+    private func reconfigureCamera(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset) {
         session.beginConfiguration()
-        session.sessionPreset = currentResolution
+        session.sessionPreset = resolution
 
         // Remove existing inputs
         for input in session.inputs {
@@ -135,7 +135,7 @@ final class CameraManager: NSObject {
         }
 
         // Add new input
-        if let device = cameraDevice(for: currentPosition),
+        if let device = cameraDevice(for: position),
            let input = try? AVCaptureDeviceInput(device: device) {
             if session.canAddInput(input) {
                 session.addInput(input)
@@ -182,11 +182,14 @@ extension CameraManager: @preconcurrency AVCaptureVideoDataOutputSampleBufferDel
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+        let quality = _captureQuality.withLock { $0 }
+        guard let jpegData = ciContext.jpegRepresentation(
+            of: ciImage,
+            colorSpace: CGColorSpaceCreateDeviceRGB(),
+            options: [kCGImageDestinationLossyCompressionQuality: quality]
+        ) else { return }
 
-        let quality = _captureQuality
-        let uiImage = UIImage(cgImage: cgImage)
-        guard let jpegData = uiImage.jpegData(compressionQuality: quality) else { return }
+        onFrameCaptured?(jpegData)
 
         Task { @MainActor [weak self] in
             self?.latestFrame = jpegData

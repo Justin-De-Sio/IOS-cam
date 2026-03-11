@@ -256,6 +256,9 @@
 				DEVELOPMENT_TEAM = L47L4BUTS4;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSBonjourServices = (
+					"_http._tcp",
+				);
 				INFOPLIST_KEY_NSCameraUsageDescription = "LinuxCam needs camera access to stream video";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "LinuxCam needs local network access to stream video to your computer";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -290,6 +293,9 @@
 				DEVELOPMENT_TEAM = L47L4BUTS4;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSBonjourServices = (
+					"_http._tcp",
+				);
 				INFOPLIST_KEY_NSCameraUsageDescription = "LinuxCam needs camera access to stream video";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "LinuxCam needs local network access to stream video to your computer";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;

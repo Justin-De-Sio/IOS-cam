@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @State private var camera = CameraManager()
@@ -81,9 +82,15 @@ struct ContentView: View {
                             if server.isRunning {
                                 server.stop()
                                 camera.stop()
+                                camera.onFrameCaptured = nil
+                                UIApplication.shared.isIdleTimerDisabled = false
                             } else {
+                                camera.onFrameCaptured = { [server] jpegData in
+                                    server.broadcast(jpegData: jpegData)
+                                }
                                 camera.start()
                                 server.start()
+                                UIApplication.shared.isIdleTimerDisabled = true
                             }
                         } label: {
                             Image(systemName: server.isRunning ? "stop.circle.fill" : "play.circle.fill")
@@ -95,11 +102,6 @@ struct ContentView: View {
                 .padding()
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 .padding()
-            }
-        }
-        .onChange(of: camera.latestFrame) { _, newFrame in
-            if server.isRunning, let data = newFrame {
-                server.broadcast(jpegData: data)
             }
         }
         .preferredColorScheme(.dark)
