@@ -7,6 +7,7 @@
 
 import AVFoundation
 import CoreImage
+import UIKit
 import os
 
 @Observable
@@ -44,6 +45,9 @@ final class CameraManager: NSObject {
 
     private var currentResolution: AVCaptureSession.Preset = .hd1920x1080
 
+    /// Current video rotation angle based on device orientation.
+    @ObservationIgnored private let _rotationAngle = OSAllocatedUnfairLock(initialState: CGFloat(90))
+
     // MARK: - Lifecycle
 
     /// Start the capture session on the dedicated queue.
@@ -51,6 +55,12 @@ final class CameraManager: NSObject {
         guard !isRunning else { return }
         let position = currentPosition
         let resolution = currentResolution
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(orientationChanged),
+            name: UIDevice.orientationDidChangeNotification, object: nil
+        )
+        updateRotationAngle(UIDevice.current.orientation)
         captureQueue.async { [weak self] in
             guard let self else { return }
             self.configureCaptureSession(position: position, resolution: resolution)
@@ -64,6 +74,8 @@ final class CameraManager: NSObject {
     /// Stop the capture session.
     func stop() {
         guard isRunning else { return }
+        NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
         captureQueue.async { [weak self] in
             guard let self else { return }
             self.session.stopRunning()
@@ -71,6 +83,22 @@ final class CameraManager: NSObject {
                 self?.isRunning = false
             }
         }
+    }
+
+    @objc private func orientationChanged() {
+        updateRotationAngle(UIDevice.current.orientation)
+    }
+
+    private func updateRotationAngle(_ orientation: UIDeviceOrientation) {
+        let angle: CGFloat
+        switch orientation {
+        case .portrait:            angle = 90
+        case .portraitUpsideDown:   angle = 270
+        case .landscapeLeft:       angle = 0
+        case .landscapeRight:      angle = 180
+        default: return // .faceUp, .faceDown, .unknown — keep current
+        }
+        _rotationAngle.withLock { $0 = angle }
     }
 
     /// Toggle between front and back camera.
@@ -180,6 +208,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        let rotationAngle = _rotationAngle.withLock { $0 }
+
+        // Apply rotation to match device orientation.
+        // The raw camera buffer is always in landscape-left (sensor native).
+        // We rotate using videoRotationAngle on the connection if supported.
+        if connection.isVideoRotationAngleSupported(rotationAngle) {
+            connection.videoRotationAngle = rotationAngle
+        }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let quality = _captureQuality.withLock { $0 }
