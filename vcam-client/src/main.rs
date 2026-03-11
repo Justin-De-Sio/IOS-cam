@@ -425,12 +425,17 @@ fn spawn_output(args: &Args, mode: &OutputMode) -> Result<Child> {
         OutputMode::Play => {
             Command::new("ffplay")
                 .args([
-                    "-fflags", "nobuffer",
+                    "-fflags", "+nobuffer+genpts",
                     "-flags", "low_delay",
                     "-probesize", "32",
                     "-analyzeduration", "0",
+                    "-sync", "ext",
                     "-framedrop",
+                    "-infbuf",
+                    "-fast",
+                    "-vf", "setpts=0",
                     "-f", "h264",
+                    "-framerate", "30",
                     "-i", "pipe:0",
                 ])
                 .stdin(Stdio::piped())
