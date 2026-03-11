@@ -10,7 +10,7 @@ import UIKit
 
 struct ContentView: View {
     @State private var camera = CameraManager()
-    @State private var server = MJPEGServer()
+    @State private var server = StreamServer()
 
     var body: some View {
         ZStack {
@@ -82,11 +82,11 @@ struct ContentView: View {
                             if server.isRunning {
                                 server.stop()
                                 camera.stop()
-                                camera.onFrameCaptured = nil
+                                camera.onH264Data = nil
                                 UIApplication.shared.isIdleTimerDisabled = false
                             } else {
-                                camera.onFrameCaptured = { [server] jpegData in
-                                    server.broadcast(jpegData: jpegData)
+                                camera.onH264Data = { [server] h264Data in
+                                    server.broadcast(data: h264Data)
                                 }
                                 camera.start()
                                 server.start()
