@@ -24,7 +24,7 @@ final class MJPEGServer {
 
     /// Client connections serving the MJPEG stream.
     /// Accessed from both serverQueue and MainActor — guarded by `connectionsLock`.
-    nonisolated private var connections: [NWConnection] = []
+    @ObservationIgnored nonisolated(unsafe) private var connections: [NWConnection] = []
     private let connectionsLock = NSLock()
 
     private let boundary = "frame"
@@ -101,7 +101,7 @@ final class MJPEGServer {
 
     /// Push a JPEG frame to all connected MJPEG clients.
     /// Safe to call from any queue; dispatches to serverQueue internally.
-    func broadcast(jpegData: Data) {
+    nonisolated func broadcast(jpegData: Data) {
         let framePayload = buildFramePayload(jpegData: jpegData)
 
         serverQueue.async { [weak self] in
@@ -237,7 +237,7 @@ final class MJPEGServer {
 
     // MARK: - Helpers
 
-    private func buildFramePayload(jpegData: Data) -> Data {
+    nonisolated private func buildFramePayload(jpegData: Data) -> Data {
         var payload = Data("--\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpegData.count)\r\n\r\n".utf8)
         payload.append(jpegData)
         payload.append(Data("\r\n".utf8))

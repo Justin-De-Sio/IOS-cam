@@ -19,7 +19,7 @@ final class CameraManager: NSObject {
     var latestFrame: Data?
 
     /// Direct callback for frame delivery — called on the capture queue.
-    nonisolated var onFrameCaptured: (@Sendable (Data) -> Void)?
+    @ObservationIgnored nonisolated(unsafe) var onFrameCaptured: (@Sendable (Data) -> Void)?
 
     /// JPEG compression quality (0.1 – 1.0). Default 0.6.
     var jpegQuality: CGFloat = 0.6 {
