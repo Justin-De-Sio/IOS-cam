@@ -210,7 +210,7 @@ fn run_stream(ip: &str, args: &Args, mode: &OutputMode) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    let mut stream = BufReader::with_capacity(64 * 1024, stream);
+    let mut stream = BufReader::with_capacity(4 * 1024, stream);
 
     // Send HTTP GET /video
     let request = format!(
@@ -292,7 +292,7 @@ fn stream_raw(
     start: &Instant,
     last_report: &mut Instant,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 8 * 1024];
 
     loop {
         let n = reader.read(&mut buf)?;
@@ -318,11 +318,13 @@ fn report_stats(bytes_total: u64, start: &Instant, last_report: &mut Instant) {
 fn spawn_output(args: &Args, mode: &OutputMode) -> Result<Child> {
     // Common low-latency input args
     let input_args = vec![
-        "-fflags", "nobuffer",
+        "-fflags", "+nobuffer+genpts",
         "-flags", "low_delay",
+        "-use_wallclock_as_timestamps", "1",
         "-probesize", "32",
         "-analyzeduration", "0",
         "-f", "h264",
+        "-framerate", "30",
         "-i", "pipe:0",
     ];
 

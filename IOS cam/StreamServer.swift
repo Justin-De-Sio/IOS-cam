@@ -1,34 +1,22 @@
-//
-//  StreamServer.swift
-//  IOS cam
-//
-//  Created by Justin De Sio on 11/03/2026.
-//
-
 import Foundation
 import Network
 
 @Observable
 final class StreamServer {
 
-    // MARK: - Published State
-
     var isRunning = false
     var connectedClients = 0
     var serverAddress = "Not connected"
 
-    // MARK: - Private
-
-    private let serverQueue = DispatchQueue(label: "com.linuxcam.server", qos: .userInteractive)
-    private var listener: NWListener?
-
-    @ObservationIgnored nonisolated(unsafe) private var connections: [NWConnection] = []
-    private let connectionsLock = NSLock()
-
-    /// Called when a new client connects — use to force a keyframe.
     @ObservationIgnored nonisolated(unsafe) var onClientConnected: (() -> Void)?
-    /// Provides initial data (SPS/PPS) to send to a new client.
     @ObservationIgnored nonisolated(unsafe) var initialDataForClient: (() -> Data?)?
+
+    private let queue = DispatchQueue(label: "com.linuxcam.server", qos: .userInteractive)
+    private var listener: NWListener?
+    @ObservationIgnored nonisolated(unsafe) private var connections: [NWConnection] = []
+    @ObservationIgnored nonisolated(unsafe) private var droppedFrames: [ObjectIdentifier: Int] = [:]
+    private let lock = NSLock()
+    private let maxDroppedBeforeDisconnect = 30
 
     private let htmlPage = Data("""
         <!DOCTYPE html>
@@ -46,57 +34,41 @@ final class StreamServer {
 
     func start() {
         guard !isRunning else { return }
-
-        let params = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
 
-        do {
-            listener = try NWListener(using: params, on: 8080)
-        } catch {
-            print("[StreamServer] Failed to create listener: \(error)")
-            return
-        }
+        do { listener = try NWListener(using: params, on: 8080) }
+        catch { print("[StreamServer] Listener failed: \(error)"); return }
 
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            switch state {
-            case .ready:
+            if case .ready = state {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.isRunning = true
-                    self.serverAddress = "\(self.getWiFiAddress() ?? "unknown"):8080"
+                    self.serverAddress = "\(self.wifiAddress ?? "unknown"):8080"
                 }
-            case .failed(let error):
-                print("[StreamServer] Listener failed: \(error)")
-                Task { @MainActor [weak self] in
-                    self?.isRunning = false
-                }
-            default:
-                break
             }
         }
 
-        listener?.newConnectionHandler = { [weak self] connection in
-            self?.handleNewConnection(connection)
+        listener?.newConnectionHandler = { [weak self] conn in
+            self?.handleNew(conn)
         }
-
-        listener?.start(queue: serverQueue)
+        listener?.start(queue: queue)
     }
 
     func stop() {
         guard isRunning else { return }
-
         listener?.cancel()
         listener = nil
 
-        connectionsLock.lock()
-        let currentConnections = connections
+        lock.lock()
+        let current = connections
         connections.removeAll()
-        connectionsLock.unlock()
-
-        for conn in currentConnections {
-            conn.cancel()
-        }
+        lock.unlock()
+        current.forEach { $0.cancel() }
 
         isRunning = false
         connectedClients = 0
@@ -105,19 +77,34 @@ final class StreamServer {
 
     // MARK: - Broadcasting
 
-    /// Push raw H.264 data to all connected stream clients.
     nonisolated func broadcast(data: Data) {
-        serverQueue.async { [weak self] in
+        queue.async { [weak self] in
             guard let self else { return }
-            self.connectionsLock.lock()
+            self.lock.lock()
             let clients = self.connections
-            self.connectionsLock.unlock()
+            self.lock.unlock()
 
-            for connection in clients {
-                connection.send(content: data, completion: .contentProcessed { error in
+            for conn in clients {
+                let id = ObjectIdentifier(conn)
+                conn.send(content: data, contentContext: .defaultMessage, isComplete: false,
+                          completion: .contentProcessed { [weak self] error in
+                    guard let self else { return }
                     if let error {
-                        print("[StreamServer] Send error: \(error)")
-                        self.removeConnection(connection)
+                        self.lock.lock()
+                        let count = (self.droppedFrames[id] ?? 0) + 1
+                        self.droppedFrames[id] = count
+                        self.lock.unlock()
+                        print("[StreamServer] Send error (\(count)/\(self.maxDroppedBeforeDisconnect)): \(error)")
+                        if count >= self.maxDroppedBeforeDisconnect {
+                            self.remove(conn)
+                            self.lock.lock()
+                            self.droppedFrames.removeValue(forKey: id)
+                            self.lock.unlock()
+                        }
+                    } else {
+                        self.lock.lock()
+                        self.droppedFrames.removeValue(forKey: id)
+                        self.lock.unlock()
                     }
                 })
             }
@@ -126,146 +113,93 @@ final class StreamServer {
 
     // MARK: - Connection Handling
 
-    private func handleNewConnection(_ connection: NWConnection) {
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .failed, .cancelled:
-                self?.removeConnection(connection)
-            default:
-                break
-            }
+    private func handleNew(_ conn: NWConnection) {
+        conn.stateUpdateHandler = { [weak self] state in
+            if case .failed = state { self?.remove(conn) }
+            if case .cancelled = state { self?.remove(conn) }
         }
+        conn.start(queue: queue)
 
-        connection.start(queue: serverQueue)
-
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, error in
-            guard let self, let data, error == nil else {
-                connection.cancel()
-                return
-            }
-
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, error in
+            guard let self, let data, error == nil else { conn.cancel(); return }
             let request = String(data: data, encoding: .utf8) ?? ""
-            self.handleHTTPRequest(request, on: connection)
+            self.route(request, on: conn)
         }
     }
 
-    private func handleHTTPRequest(_ request: String, on connection: NWConnection) {
-        let firstLine = request.components(separatedBy: "\r\n").first ?? ""
-        let parts = firstLine.components(separatedBy: " ")
+    private func route(_ request: String, on conn: NWConnection) {
+        let parts = (request.components(separatedBy: "\r\n").first ?? "").components(separatedBy: " ")
         let method = parts.count > 0 ? parts[0] : ""
         let path = parts.count > 1 ? parts[1] : ""
 
         guard method == "GET" else {
-            sendHTTPResponse(connection: connection, status: "405 Method Not Allowed",
-                             contentType: "text/plain", body: Data("Method Not Allowed".utf8))
+            respond(conn, status: "405 Method Not Allowed", type: "text/plain", body: Data("Method Not Allowed".utf8))
             return
         }
 
         switch path {
-        case "/":
-            sendHTTPResponse(connection: connection, status: "200 OK",
-                             contentType: "text/html", body: htmlPage)
-
-        case "/video":
-            startH264Stream(on: connection)
-
-        default:
-            sendHTTPResponse(connection: connection, status: "404 Not Found",
-                             contentType: "text/plain", body: Data("Not Found".utf8))
+        case "/":      respond(conn, status: "200 OK", type: "text/html", body: htmlPage)
+        case "/video": startStream(on: conn)
+        default:       respond(conn, status: "404 Not Found", type: "text/plain", body: Data("Not Found".utf8))
         }
     }
 
-    private func sendHTTPResponse(connection: NWConnection, status: String,
-                                  contentType: String, body: Data) {
-        var header = "HTTP/1.1 \(status)\r\n"
-        header += "Content-Type: \(contentType)\r\n"
-        header += "Content-Length: \(body.count)\r\n"
-        header += "Connection: close\r\n"
-        header += "\r\n"
-
+    private func respond(_ conn: NWConnection, status: String, type: String, body: Data) {
+        let header = "HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         var response = Data(header.utf8)
         response.append(body)
-
-        connection.send(content: response, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        conn.send(content: response, completion: .contentProcessed { _ in conn.cancel() })
     }
 
-    private func startH264Stream(on connection: NWConnection) {
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+    private func startStream(on conn: NWConnection) {
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        var payload = Data(header.utf8)
+        if let params = initialDataForClient?() { payload.append(params) }
 
-        // Build initial payload: HTTP header + cached SPS/PPS if available
-        var initialPayload = Data(header.utf8)
-        if let paramSets = initialDataForClient?() {
-            initialPayload.append(paramSets)
-        }
-
-        connection.send(content: initialPayload, completion: .contentProcessed { [weak self] error in
+        conn.send(content: payload, contentContext: .defaultMessage, isComplete: false,
+                  completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            if let error {
-                print("[StreamServer] Failed to send stream header: \(error)")
-                connection.cancel()
-                return
-            }
-
-            self.addConnection(connection)
-            // Request a keyframe so the new client gets SPS/PPS + IDR immediately
+            if error != nil { conn.cancel(); return }
+            self.add(conn)
             self.onClientConnected?()
         })
     }
 
-    // MARK: - Connection Tracking
+    // MARK: - Tracking
 
-    private func addConnection(_ connection: NWConnection) {
-        connectionsLock.lock()
-        connections.append(connection)
+    private func add(_ conn: NWConnection) {
+        lock.lock()
+        connections.append(conn)
         let count = connections.count
-        connectionsLock.unlock()
-
-        Task { @MainActor [weak self] in
-            self?.connectedClients = count
-        }
+        lock.unlock()
+        Task { @MainActor [weak self] in self?.connectedClients = count }
     }
 
-    private func removeConnection(_ connection: NWConnection) {
-        connectionsLock.lock()
-        connections.removeAll { $0 === connection }
+    private func remove(_ conn: NWConnection) {
+        lock.lock()
+        connections.removeAll { $0 === conn }
         let count = connections.count
-        connectionsLock.unlock()
-
-        connection.cancel()
-
-        Task { @MainActor [weak self] in
-            self?.connectedClients = count
-        }
+        lock.unlock()
+        conn.cancel()
+        Task { @MainActor [weak self] in self?.connectedClients = count }
     }
 
     // MARK: - Helpers
 
-    nonisolated private func getWiFiAddress() -> String? {
-        var address: String?
+    nonisolated private var wifiAddress: String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
-
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
         defer { freeifaddrs(ifaddr) }
 
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let interface = ptr.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-
-            guard addrFamily == UInt8(AF_INET) else { continue }
-
-            let name = String(cString: interface.ifa_name)
-            guard name == "en0" else { continue }
-
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let iface = ptr.pointee
+            guard iface.ifa_addr.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: iface.ifa_name) == "en0" else { continue }
             var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                        &hostname, socklen_t(hostname.count),
-                        nil, socklen_t(0), NI_NUMERICHOST)
-            address = String(cString: hostname)
-            break
+            getnameinfo(iface.ifa_addr, socklen_t(iface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            return String(cString: hostname)
         }
-
-        return address
+        return nil
     }
 }

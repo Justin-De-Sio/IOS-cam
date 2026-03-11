@@ -1,10 +1,3 @@
-//
-//  CameraManager.swift
-//  IOS cam
-//
-//  Created by Justin De Sio on 11/03/2026.
-//
-
 import AVFoundation
 import VideoToolbox
 import UIKit
@@ -12,7 +5,7 @@ import os
 
 // MARK: - Stream Profile
 
-enum StreamProfile: String, CaseIterable {
+nonisolated enum StreamProfile: String, CaseIterable, Sendable {
     case lowLatency
     case highQuality
 
@@ -32,8 +25,8 @@ enum StreamProfile: String, CaseIterable {
 
     var bitrate: Int {
         switch self {
-        case .lowLatency:  return 1_500_000   // 1.5 Mbps
-        case .highQuality: return 5_000_000   // 5 Mbps
+        case .lowLatency:  return 1_500_000
+        case .highQuality: return 5_000_000
         }
     }
 
@@ -46,96 +39,66 @@ enum StreamProfile: String, CaseIterable {
 
     var keyFrameInterval: Int {
         switch self {
-        case .lowLatency:  return 30   // 1s at 30fps — frequent keyframes for low latency
-        case .highQuality: return 90   // 3s at 30fps — better compression
-        }
-    }
-
-    var frameRate: Int32 {
-        switch self {
         case .lowLatency:  return 30
-        case .highQuality: return 30
+        case .highQuality: return 90
         }
     }
 
-    var description: String {
+    var subtitle: String {
         switch self {
-        case .lowLatency:  return "720p \u{2022} 1.5Mbps \u{2022} Baseline"
-        case .highQuality: return "1080p \u{2022} 5Mbps \u{2022} High"
+        case .lowLatency:  return "720p \u{2022} 1.5Mbps"
+        case .highQuality: return "1080p \u{2022} 5Mbps"
         }
     }
 }
 
+// MARK: - Camera Manager
+
 @Observable
 final class CameraManager: NSObject {
-
-    // MARK: - Published State
 
     var isRunning = false
     var currentPosition: AVCaptureDevice.Position = .back
     var currentProfile: StreamProfile = .lowLatency
 
-    /// Direct callback for H.264 data delivery — called on the capture queue.
-    @ObservationIgnored nonisolated(unsafe) var onH264Data: (@Sendable (Data) -> Void)?
-
-    /// Expose the session so SwiftUI can show a camera preview.
     var previewSession: AVCaptureSession { session }
+
+    /// Callback: delivers H.264 Annex-B data chunks on captureQueue.
+    @ObservationIgnored nonisolated(unsafe) var onH264Data: ((Data) -> Void)?
+
+    /// Latest SPS/PPS to send to newly connected clients.
+    @ObservationIgnored nonisolated(unsafe) var latestParamSets: Data?
 
     // MARK: - Private
 
     private let session = AVCaptureSession()
     private let captureQueue = DispatchQueue(label: "com.linuxcam.capture", qos: .userInteractive)
+    @ObservationIgnored nonisolated(unsafe) private var encoder: VTCompressionSession?
+    @ObservationIgnored nonisolated(unsafe) private var encoderSize = (w: Int32(0), h: Int32(0))
+    @ObservationIgnored nonisolated(unsafe) private var forceNextKeyframe = false
 
-    private var currentResolution: AVCaptureSession.Preset = .hd1280x720
+    /// Profile settings snapshot safe to read from captureQueue.
+    @ObservationIgnored nonisolated(unsafe) private var activeProfile = StreamProfile.lowLatency
 
-    /// Current video rotation angle based on device orientation.
-    @ObservationIgnored private let _rotationAngle = OSAllocatedUnfairLock(initialState: CGFloat(90))
+    /// Rotation angle safe to read from captureQueue.
+    @ObservationIgnored nonisolated(unsafe) private var rotationAngle: CGFloat = 90
 
-    /// H.264 hardware encoder session.
-    @ObservationIgnored nonisolated(unsafe) private var compressionSession: VTCompressionSession?
-    @ObservationIgnored private let _encoderDimensions = OSAllocatedUnfairLock(initialState: (width: Int32(0), height: Int32(0)))
-    /// Thread-safe copy of profile settings for the encoder.
-    @ObservationIgnored private let _profileSettings = OSAllocatedUnfairLock(initialState: (
-        bitrate: 1_500_000,
-        profileLevel: kVTProfileLevel_H264_Baseline_AutoLevel,
-        keyFrameInterval: 30
-    ))
-    /// Latest SPS/PPS data to send to newly connected clients.
-    @ObservationIgnored private let _latestParamSets = OSAllocatedUnfairLock<Data?>(initialState: nil)
-    /// Flag to force next frame as keyframe (set when client connects).
-    @ObservationIgnored private let _forceKeyframe = OSAllocatedUnfairLock(initialState: false)
-
-    /// Force the encoder to produce a keyframe (with SPS/PPS) on the next frame.
-    /// Call this when a new client connects.
-    func requestKeyframe() {
-        _forceKeyframe.withLock { $0 = true }
-    }
-
-    /// Get the latest cached SPS/PPS Annex-B data, if available.
-    var latestParameterSets: Data? {
-        _latestParamSets.withLock { $0 }
-    }
-
-    // MARK: - Lifecycle
+    // MARK: - Public
 
     func start() {
         guard !isRunning else { return }
-        let position = currentPosition
-        let resolution = currentResolution
-        let frameRate = currentProfile.frameRate
+        activeProfile = currentProfile
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(orientationChanged),
-            name: UIDevice.orientationDidChangeNotification, object: nil
-        )
-        updateRotationAngle(UIDevice.current.orientation)
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            self.configureCaptureSession(position: position, resolution: resolution, frameRate: frameRate)
-            self.session.startRunning()
-            Task { @MainActor [weak self] in
-                self?.isRunning = true
-            }
+        NotificationCenter.default.addObserver(self, selector: #selector(orientationChanged),
+                                               name: UIDevice.orientationDidChangeNotification, object: nil)
+        updateRotation(UIDevice.current.orientation)
+
+        let pos = currentPosition
+        let preset = currentProfile.resolution
+        captureQueue.async { [self] in
+            configureSession(position: pos, preset: preset)
+            session.startRunning()
+            Task { @MainActor [self] in self.isRunning = true }
         }
     }
 
@@ -143,325 +106,222 @@ final class CameraManager: NSObject {
         guard isRunning else { return }
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
         UIDevice.current.endGeneratingDeviceOrientationNotifications()
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            self.session.stopRunning()
-            self.destroyEncoder()
-            Task { @MainActor [weak self] in
-                self?.isRunning = false
-            }
+        captureQueue.async { [self] in
+            session.stopRunning()
+            destroyEncoder()
+            Task { @MainActor [self] in self.isRunning = false }
         }
-    }
-
-    @objc private func orientationChanged() {
-        updateRotationAngle(UIDevice.current.orientation)
-    }
-
-    private func updateRotationAngle(_ orientation: UIDeviceOrientation) {
-        let angle: CGFloat
-        switch orientation {
-        case .portrait:            angle = 90
-        case .portraitUpsideDown:   angle = 270
-        case .landscapeLeft:       angle = 0
-        case .landscapeRight:      angle = 180
-        default: return
-        }
-        _rotationAngle.withLock { $0 = angle }
     }
 
     func toggleCamera() {
         currentPosition = (currentPosition == .back) ? .front : .back
-        let position = currentPosition
-        let resolution = currentResolution
-        let frameRate = currentProfile.frameRate
-        captureQueue.async { [weak self] in
-            self?.destroyEncoder()
-            self?.reconfigureCamera(position: position, resolution: resolution, frameRate: frameRate)
+        let pos = currentPosition
+        let preset = currentProfile.resolution
+        captureQueue.async { [self] in
+            destroyEncoder()
+            reconfigure(position: pos, preset: preset)
         }
     }
 
     func applyProfile(_ profile: StreamProfile) {
         currentProfile = profile
-        currentResolution = profile.resolution
-        let bitrate = profile.bitrate
-        let profileLevel = profile.profileLevel
-        let keyFrameInterval = profile.keyFrameInterval
-        _profileSettings.withLock {
-            $0 = (bitrate: bitrate, profileLevel: profileLevel, keyFrameInterval: keyFrameInterval)
-        }
-        let position = currentPosition
-        let resolution = profile.resolution
-        let frameRate = profile.frameRate
-        if isRunning {
-            captureQueue.async { [weak self] in
-                self?.destroyEncoder()
-                self?.reconfigureCamera(position: position, resolution: resolution, frameRate: frameRate)
-            }
+        activeProfile = profile
+        guard isRunning else { return }
+        let pos = currentPosition
+        let preset = profile.resolution
+        captureQueue.async { [self] in
+            destroyEncoder()
+            reconfigure(position: pos, preset: preset)
         }
     }
 
-    // MARK: - Session Configuration
+    func requestKeyframe() {
+        forceNextKeyframe = true
+    }
 
-    private func configureCaptureSession(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset, frameRate: Int32) {
+    // MARK: - Orientation
+
+    @objc private func orientationChanged() {
+        updateRotation(UIDevice.current.orientation)
+    }
+
+    private func updateRotation(_ o: UIDeviceOrientation) {
+        switch o {
+        case .portrait:          rotationAngle = 90
+        case .portraitUpsideDown: rotationAngle = 270
+        case .landscapeLeft:     rotationAngle = 0
+        case .landscapeRight:    rotationAngle = 180
+        default: break
+        }
+    }
+
+    // MARK: - AVCaptureSession
+
+    private func configureSession(position: AVCaptureDevice.Position, preset: AVCaptureSession.Preset) {
         session.beginConfiguration()
-        session.sessionPreset = resolution
+        session.sessionPreset = preset
 
-        if let device = cameraDevice(for: position),
-           let input = try? AVCaptureDeviceInput(device: device) {
-            if session.canAddInput(input) {
-                session.addInput(input)
-            }
-            configureFrameRate(device: device, frameRate: frameRate)
+        if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+           let input = try? AVCaptureDeviceInput(device: device),
+           session.canAddInput(input) {
+            session.addInput(input)
+            try? device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.unlockForConfiguration()
         }
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         output.setSampleBufferDelegate(self, queue: captureQueue)
-        if session.canAddOutput(output) {
-            session.addOutput(output)
-        }
+        if session.canAddOutput(output) { session.addOutput(output) }
 
         session.commitConfiguration()
     }
 
-    private func reconfigureCamera(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset, frameRate: Int32) {
+    private func reconfigure(position: AVCaptureDevice.Position, preset: AVCaptureSession.Preset) {
         session.beginConfiguration()
-        session.sessionPreset = resolution
+        session.sessionPreset = preset
+        session.inputs.forEach { session.removeInput($0) }
 
-        for input in session.inputs {
-            session.removeInput(input)
-        }
-
-        if let device = cameraDevice(for: position),
-           let input = try? AVCaptureDeviceInput(device: device) {
-            if session.canAddInput(input) {
-                session.addInput(input)
-            }
-            configureFrameRate(device: device, frameRate: frameRate)
+        if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+           let input = try? AVCaptureDeviceInput(device: device),
+           session.canAddInput(input) {
+            session.addInput(input)
+            try? device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.unlockForConfiguration()
         }
 
         session.commitConfiguration()
-    }
-
-    private func cameraDevice(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
-        AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera],
-            mediaType: .video,
-            position: position
-        ).devices.first
-    }
-
-    private func configureFrameRate(device: AVCaptureDevice, frameRate: Int32) {
-        do {
-            try device.lockForConfiguration()
-            let frameDuration = CMTime(value: 1, timescale: frameRate)
-            device.activeVideoMinFrameDuration = frameDuration
-            device.activeVideoMaxFrameDuration = frameDuration
-            device.unlockForConfiguration()
-        } catch {
-            print("[CameraManager] Failed to configure device: \(error)")
-        }
     }
 
     // MARK: - H.264 Encoder
 
-    nonisolated private func createEncoder(width: Int32, height: Int32) {
+    nonisolated private func createEncoder(w: Int32, h: Int32) {
         destroyEncoder()
+        let p = activeProfile
 
-        let settings = _profileSettings.withLock { $0 }
+        var s: VTCompressionSession?
+        guard VTCompressionSessionCreate(allocator: nil, width: w, height: h,
+                                         codecType: kCMVideoCodecType_H264,
+                                         encoderSpecification: nil, imageBufferAttributes: nil,
+                                         compressedDataAllocator: nil, outputCallback: nil,
+                                         refcon: nil, compressionSessionOut: &s) == noErr,
+              let s else { return }
 
-        var session: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            width: width,
-            height: height,
-            codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: nil,
-            refcon: nil,
-            compressionSessionOut: &session
-        )
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: p.profileLevel)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: p.bitrate as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: p.keyFrameInterval as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+        let limit = [(p.bitrate / 8) as CFNumber, 1.0 as CFNumber] as CFArray
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limit)
 
-        guard status == noErr, let session else {
-            print("[CameraManager] Failed to create encoder: \(status)")
-            return
-        }
-
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: settings.profileLevel)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: settings.bitrate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: settings.keyFrameInterval as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-
-        // Limit data rate
-        let byteLimit = (settings.bitrate / 8) as CFNumber
-        let oneSecond = 1.0 as CFNumber
-        let dataRateLimits = [byteLimit, oneSecond] as CFArray
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits)
-
-        VTCompressionSessionPrepareToEncodeFrames(session)
-        compressionSession = session
-        _encoderDimensions.withLock {
-            $0 = (width, height)
-        }
+        VTCompressionSessionPrepareToEncodeFrames(s)
+        encoder = s
+        encoderSize = (w, h)
     }
 
     nonisolated private func destroyEncoder() {
-        if let session = compressionSession {
-            VTCompressionSessionInvalidate(session)
-            compressionSession = nil
-        }
-        _encoderDimensions.withLock { $0 = (0, 0) }
+        if let e = encoder { VTCompressionSessionInvalidate(e) }
+        encoder = nil
+        encoderSize = (0, 0)
     }
 
-    /// Extract SPS and PPS from format description as Annex-B data.
-    nonisolated private func extractParameterSets(from formatDesc: CMFormatDescription) -> Data? {
-        let startCode = Data([0x00, 0x00, 0x00, 0x01])
-        var paramData = Data()
+    // MARK: - H.264 Annex-B Conversion
 
-        // Get number of parameter sets
-        var paramCount = 0
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc, parameterSetIndex: 0,
-            parameterSetPointerOut: nil, parameterSetSizeOut: nil,
-            parameterSetCountOut: &paramCount, nalUnitHeaderLengthOut: nil
-        ) == noErr else { return nil }
+    nonisolated private func annexB(from sampleBuffer: CMSampleBuffer) -> Data? {
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
 
-        // Extract each parameter set (SPS at 0, PPS at 1, etc.)
-        for i in 0..<paramCount {
-            var paramPointer: UnsafePointer<UInt8>?
-            var paramSize = 0
-            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                formatDesc, parameterSetIndex: i,
-                parameterSetPointerOut: &paramPointer, parameterSetSizeOut: &paramSize,
-                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
-            ) == noErr, let paramPointer else { continue }
+        var len = 0
+        var ptr: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                          totalLengthOut: &len, dataPointerOut: &ptr) == noErr,
+              let ptr else { return nil }
 
-            paramData.append(startCode)
-            paramData.append(paramPointer, count: paramSize)
-        }
+        let sc = Data([0x00, 0x00, 0x00, 0x01])
+        var out = Data()
 
-        return paramData.isEmpty ? nil : paramData
-    }
-
-    /// Convert AVCC format (length-prefixed NALUs) to Annex-B (start code prefixed).
-    /// Prepends SPS and PPS before keyframes.
-    nonisolated private func extractH264AnnexB(from sampleBuffer: CMSampleBuffer) -> Data? {
-        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
-
-        var totalLength = 0
-        var dataPointer: UnsafeMutablePointer<CChar>?
-        let status = CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-        guard status == kCMBlockBufferNoErr, let dataPointer else { return nil }
-
-        var result = Data()
-
-        let startCode = Data([0x00, 0x00, 0x00, 0x01])
-
-        // Detect keyframe using Swift-bridged attachments
-        let isKeyframe: Bool
-        if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
-           let first = attachmentsArray.first {
-            // kCMSampleAttachmentKey_DependsOnOthers == false means keyframe
-            // kCMSampleAttachmentKey_NotSync absent means keyframe
-            let dependsOnOthers = first[kCMSampleAttachmentKey_DependsOnOthers] as? Bool ?? false
-            isKeyframe = !dependsOnOthers
+        // Keyframe? → prepend SPS/PPS
+        let isKey: Bool
+        if let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+           let first = arr.first {
+            isKey = !(first[kCMSampleAttachmentKey_DependsOnOthers] as? Bool ?? false)
         } else {
-            isKeyframe = true
+            isKey = true
         }
 
-        // On keyframe, extract and prepend SPS/PPS
-        if isKeyframe, let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            if let paramSets = extractParameterSets(from: formatDesc) {
-                result.append(paramSets)
-                // Cache for new clients
-                _latestParamSets.withLock { $0 = paramSets }
+        if isKey, let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
+            var count = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0,
+                parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+                parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+
+            var paramSets = Data()
+            for i in 0..<count {
+                var p: UnsafePointer<UInt8>?
+                var s = 0
+                guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: i,
+                    parameterSetPointerOut: &p, parameterSetSizeOut: &s,
+                    parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                      let p else { continue }
+                paramSets.append(sc)
+                paramSets.append(p, count: s)
+            }
+            if !paramSets.isEmpty {
+                latestParamSets = paramSets
+                out.append(paramSets)
             }
         }
 
-        // Convert AVCC NALUs to Annex-B
-        var offset = 0
-        let lengthHeaderSize = 4
-        while offset < totalLength - lengthHeaderSize {
-            var naluLength: UInt32 = 0
-            memcpy(&naluLength, dataPointer + offset, lengthHeaderSize)
-            naluLength = naluLength.bigEndian
-            offset += lengthHeaderSize
-
-            guard naluLength > 0, offset + Int(naluLength) <= totalLength else { break }
-
-            result.append(startCode)
-            result.append(Data(bytes: dataPointer + offset, count: Int(naluLength)))
-            offset += Int(naluLength)
+        // AVCC → Annex-B
+        var off = 0
+        while off + 4 <= len {
+            var naluLen: UInt32 = 0
+            memcpy(&naluLen, ptr + off, 4)
+            naluLen = naluLen.bigEndian
+            off += 4
+            guard naluLen > 0, off + Int(naluLen) <= len else { break }
+            out.append(sc)
+            out.append(Data(bytes: ptr + off, count: Int(naluLen)))
+            off += Int(naluLen)
         }
 
-        return result.isEmpty ? nil : result
+        return out.isEmpty ? nil : out
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+// MARK: - Capture Delegate
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
+        guard let px = CMSampleBufferGetImageBuffer(sb) else { return }
 
-    nonisolated func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let angle = rotationAngle
+        if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
 
-        // Apply rotation
-        let rotationAngle = _rotationAngle.withLock { $0 }
-        if connection.isVideoRotationAngleSupported(rotationAngle) {
-            connection.videoRotationAngle = rotationAngle
-        }
+        let w = Int32(CVPixelBufferGetWidth(px)), h = Int32(CVPixelBufferGetHeight(px))
+        if encoder == nil || encoderSize.w != w || encoderSize.h != h { createEncoder(w: w, h: h) }
+        guard let enc = encoder else { return }
 
-        let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
-        let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
-
-        // Recreate encoder if dimensions changed (rotation, resolution change)
-        let currentDims = _encoderDimensions.withLock { $0 }
-        if compressionSession == nil || currentDims.width != width || currentDims.height != height {
-            createEncoder(width: width, height: height)
-        }
-
-        guard let session = compressionSession else { return }
-
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-        // Check if we need to force a keyframe
-        var frameProps: CFDictionary?
-        let needsKeyframe = _forceKeyframe.withLock { val in
-            let result = val
-            val = false
-            return result
-        }
-        if needsKeyframe {
-            frameProps = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        var props: CFDictionary?
+        if forceNextKeyframe {
+            forceNextKeyframe = false
+            props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
         }
 
         var flags = VTEncodeInfoFlags()
-        let encodeStatus = VTCompressionSessionEncodeFrame(
-            session,
-            imageBuffer: pixelBuffer,
-            presentationTimeStamp: pts,
-            duration: .invalid,
-            frameProperties: frameProps,
-            infoFlagsOut: &flags
-        ) { [weak self] status, _, encodedBuffer in
-            guard status == noErr, let encodedBuffer, let self else { return }
-            if let h264Data = self.extractH264AnnexB(from: encodedBuffer) {
-                self.onH264Data?(h264Data)
-            }
-        }
-
-        if encodeStatus != noErr {
-            print("[CameraManager] Encode failed: \(encodeStatus)")
+        VTCompressionSessionEncodeFrame(enc, imageBuffer: px,
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sb),
+            duration: .invalid, frameProperties: props, infoFlagsOut: &flags
+        ) { [self] status, _, buf in
+            guard status == noErr, let buf, let data = annexB(from: buf) else { return }
+            onH264Data?(data)
         }
     }
 }

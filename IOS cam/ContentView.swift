@@ -1,10 +1,3 @@
-//
-//  ContentView.swift
-//  IOS cam
-//
-//  Created by Justin De Sio on 11/03/2026.
-//
-
 import SwiftUI
 import UIKit
 
@@ -21,14 +14,12 @@ struct ContentView: View {
                 Spacer()
 
                 VStack(spacing: 12) {
-                    // Server address
                     if server.isRunning {
                         Text(server.serverAddress)
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.white)
                     }
 
-                    // Client count
                     HStack(spacing: 6) {
                         Circle()
                             .fill(server.connectedClients > 0 ? .green : .gray)
@@ -45,10 +36,8 @@ struct ContentView: View {
                                 camera.applyProfile(profile)
                             } label: {
                                 VStack(spacing: 2) {
-                                    Text(profile.displayName)
-                                        .font(.caption.bold())
-                                    Text(profile.description)
-                                        .font(.system(size: 9))
+                                    Text(profile.displayName).font(.caption.bold())
+                                    Text(profile.subtitle).font(.system(size: 9))
                                 }
                                 .foregroundStyle(camera.currentProfile == profile ? .black : .white)
                                 .padding(.horizontal, 10)
@@ -64,12 +53,9 @@ struct ContentView: View {
                         }
                     }
 
-                    // Controls row
+                    // Controls
                     HStack(spacing: 16) {
-                        // Camera flip
-                        Button {
-                            camera.toggleCamera()
-                        } label: {
+                        Button { camera.toggleCamera() } label: {
                             Image(systemName: "camera.rotate")
                                 .font(.title3)
                                 .foregroundStyle(.white)
@@ -77,30 +63,7 @@ struct ContentView: View {
                                 .background(.ultraThinMaterial, in: Circle())
                         }
 
-                        // ON / OFF toggle
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                if server.isRunning {
-                                    server.stop()
-                                    camera.stop()
-                                    camera.onH264Data = nil
-                                    UIApplication.shared.isIdleTimerDisabled = false
-                                } else {
-                                    camera.onH264Data = { [server] h264Data in
-                                        server.broadcast(data: h264Data)
-                                    }
-                                    server.onClientConnected = { [camera] in
-                                        camera.requestKeyframe()
-                                    }
-                                    server.initialDataForClient = { [camera] in
-                                        camera.latestParameterSets
-                                    }
-                                    camera.start()
-                                    server.start()
-                                    UIApplication.shared.isIdleTimerDisabled = true
-                                }
-                            }
-                        } label: {
+                        Button { toggle() } label: {
                             HStack(spacing: 8) {
                                 Circle()
                                     .fill(server.isRunning ? .green : .red.opacity(0.5))
@@ -117,8 +80,10 @@ struct ContentView: View {
                                 in: Capsule()
                             )
                             .overlay(
-                                Capsule()
-                                    .stroke(server.isRunning ? .green.opacity(0.6) : .red.opacity(0.3), lineWidth: 1.5)
+                                Capsule().stroke(
+                                    server.isRunning ? .green.opacity(0.6) : .red.opacity(0.3),
+                                    lineWidth: 1.5
+                                )
                             )
                         }
                     }
@@ -130,6 +95,30 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
+    }
+
+    private func toggle() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if server.isRunning {
+                server.stop()
+                camera.stop()
+                camera.onH264Data = nil
+                UIApplication.shared.isIdleTimerDisabled = false
+            } else {
+                camera.onH264Data = { [server] data in
+                    server.broadcast(data: data)
+                }
+                server.onClientConnected = { [camera] in
+                    camera.requestKeyframe()
+                }
+                server.initialDataForClient = { [camera] in
+                    camera.latestParamSets
+                }
+                camera.start()
+                server.start()
+                UIApplication.shared.isIdleTimerDisabled = true
+            }
+        }
     }
 }
 
