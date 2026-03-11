@@ -7,12 +7,10 @@
 
 import SwiftUI
 import UIKit
-import AVFoundation
 
 struct ContentView: View {
     @State private var camera = CameraManager()
     @State private var server = MJPEGServer()
-    @State private var is4K = false
 
     var body: some View {
         ZStack {
@@ -40,33 +38,34 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
 
-                    // JPEG quality slider
-                    HStack {
-                        Text("Quality")
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                        Slider(value: $camera.jpegQuality, in: 0.1...1.0, step: 0.1)
-                        Text("\(Int(camera.jpegQuality * 100))%")
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                            .frame(width: 40, alignment: .trailing)
+                    // Profile picker
+                    HStack(spacing: 8) {
+                        ForEach(StreamProfile.allCases, id: \.self) { profile in
+                            Button {
+                                camera.applyProfile(profile)
+                            } label: {
+                                VStack(spacing: 2) {
+                                    Text(profile.displayName)
+                                        .font(.caption.bold())
+                                    Text(profile.description)
+                                        .font(.system(size: 9))
+                                }
+                                .foregroundStyle(camera.currentProfile == profile ? .black : .white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .frame(maxWidth: .infinity)
+                                .background(
+                                    camera.currentProfile == profile
+                                        ? AnyShapeStyle(.white)
+                                        : AnyShapeStyle(.ultraThinMaterial),
+                                    in: RoundedRectangle(cornerRadius: 8)
+                                )
+                            }
+                        }
                     }
 
                     // Controls row
                     HStack(spacing: 20) {
-                        // Resolution toggle
-                        Button {
-                            is4K.toggle()
-                            camera.setResolution(is4K ? .hd4K3840x2160 : .hd1920x1080)
-                        } label: {
-                            Text(is4K ? "4K" : "1080p")
-                                .font(.caption.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
-                        }
-
                         // Camera flip
                         Button {
                             camera.toggleCamera()

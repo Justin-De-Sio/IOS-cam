@@ -10,6 +10,48 @@ import CoreImage
 import UIKit
 import os
 
+// MARK: - Stream Profile
+
+enum StreamProfile: String, CaseIterable {
+    case lowLatency
+    case highQuality
+
+    var displayName: String {
+        switch self {
+        case .lowLatency:  return "Low Latency"
+        case .highQuality: return "High Quality"
+        }
+    }
+
+    var resolution: AVCaptureSession.Preset {
+        switch self {
+        case .lowLatency:  return .hd1280x720
+        case .highQuality: return .hd1920x1080
+        }
+    }
+
+    var jpegQuality: CGFloat {
+        switch self {
+        case .lowLatency:  return 0.4
+        case .highQuality: return 0.8
+        }
+    }
+
+    var frameRate: Int32 {
+        switch self {
+        case .lowLatency:  return 30
+        case .highQuality: return 30
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .lowLatency:  return "720p \u{2022} 40% JPEG \u{2022} 30fps"
+        case .highQuality: return "1080p \u{2022} 80% JPEG \u{2022} 30fps"
+        }
+    }
+}
+
 @Observable
 final class CameraManager: NSObject {
 
@@ -18,12 +60,13 @@ final class CameraManager: NSObject {
     var isRunning = false
     var currentPosition: AVCaptureDevice.Position = .back
     var latestFrame: Data?
+    var currentProfile: StreamProfile = .lowLatency
 
     /// Direct callback for frame delivery — called on the capture queue.
     @ObservationIgnored nonisolated(unsafe) var onFrameCaptured: (@Sendable (Data) -> Void)?
 
-    /// JPEG compression quality (0.1 – 1.0). Default 0.6.
-    var jpegQuality: CGFloat = 0.6 {
+    /// JPEG compression quality (0.1 – 1.0).
+    var jpegQuality: CGFloat = 0.4 {
         didSet {
             let clamped = min(max(jpegQuality, 0.1), 1.0)
             if jpegQuality != clamped { jpegQuality = clamped }
@@ -41,9 +84,9 @@ final class CameraManager: NSObject {
     private let ciContext = CIContext()
 
     /// Thread-safe mirror of `jpegQuality` for use on the capture queue.
-    private let _captureQuality = OSAllocatedUnfairLock(initialState: CGFloat(0.6))
+    private let _captureQuality = OSAllocatedUnfairLock(initialState: CGFloat(0.4))
 
-    private var currentResolution: AVCaptureSession.Preset = .hd1920x1080
+    private var currentResolution: AVCaptureSession.Preset = .hd1280x720
 
     /// Current video rotation angle based on device orientation.
     @ObservationIgnored private let _rotationAngle = OSAllocatedUnfairLock(initialState: CGFloat(90))
@@ -55,6 +98,7 @@ final class CameraManager: NSObject {
         guard !isRunning else { return }
         let position = currentPosition
         let resolution = currentResolution
+        let frameRate = currentProfile.frameRate
         UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         NotificationCenter.default.addObserver(
             self, selector: #selector(orientationChanged),
@@ -63,7 +107,7 @@ final class CameraManager: NSObject {
         updateRotationAngle(UIDevice.current.orientation)
         captureQueue.async { [weak self] in
             guard let self else { return }
-            self.configureCaptureSession(position: position, resolution: resolution)
+            self.configureCaptureSession(position: position, resolution: resolution, frameRate: frameRate)
             self.session.startRunning()
             Task { @MainActor [weak self] in
                 self?.isRunning = true
@@ -106,26 +150,31 @@ final class CameraManager: NSObject {
         currentPosition = (currentPosition == .back) ? .front : .back
         let position = currentPosition
         let resolution = currentResolution
+        let frameRate = currentProfile.frameRate
         captureQueue.async { [weak self] in
-            self?.reconfigureCamera(position: position, resolution: resolution)
+            self?.reconfigureCamera(position: position, resolution: resolution, frameRate: frameRate)
         }
     }
 
-    /// Switch between 1080p and 4K resolution.
-    func setResolution(_ preset: AVCaptureSession.Preset) {
-        guard preset == .hd1920x1080 || preset == .hd4K3840x2160 else { return }
-        currentResolution = preset
+    /// Apply a stream profile (resolution + quality + frame rate).
+    func applyProfile(_ profile: StreamProfile) {
+        currentProfile = profile
+        currentResolution = profile.resolution
+        jpegQuality = profile.jpegQuality
         let position = currentPosition
-        let resolution = preset
-        captureQueue.async { [weak self] in
-            self?.reconfigureCamera(position: position, resolution: resolution)
+        let resolution = profile.resolution
+        let frameRate = profile.frameRate
+        if isRunning {
+            captureQueue.async { [weak self] in
+                self?.reconfigureCamera(position: position, resolution: resolution, frameRate: frameRate)
+            }
         }
     }
 
     // MARK: - Session Configuration
 
     /// Full initial configuration — called once from `start()`.
-    private func configureCaptureSession(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset) {
+    private func configureCaptureSession(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset, frameRate: Int32) {
         session.beginConfiguration()
         session.sessionPreset = resolution
 
@@ -135,7 +184,7 @@ final class CameraManager: NSObject {
             if session.canAddInput(input) {
                 session.addInput(input)
             }
-            configure(device: device)
+            configureFrameRate(device: device, frameRate: frameRate)
         }
 
         // Add video data output
@@ -152,8 +201,8 @@ final class CameraManager: NSObject {
         session.commitConfiguration()
     }
 
-    /// Reconfigure input after camera toggle or resolution change.
-    private func reconfigureCamera(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset) {
+    /// Reconfigure input after camera toggle, resolution, or profile change.
+    private func reconfigureCamera(position: AVCaptureDevice.Position, resolution: AVCaptureSession.Preset, frameRate: Int32) {
         session.beginConfiguration()
         session.sessionPreset = resolution
 
@@ -168,7 +217,7 @@ final class CameraManager: NSObject {
             if session.canAddInput(input) {
                 session.addInput(input)
             }
-            configure(device: device)
+            configureFrameRate(device: device, frameRate: frameRate)
         }
 
         session.commitConfiguration()
@@ -184,11 +233,11 @@ final class CameraManager: NSObject {
         return discoverySession.devices.first
     }
 
-    /// Lock the device and set 30 fps.
-    private func configure(device: AVCaptureDevice) {
+    /// Lock the device and set the target frame rate.
+    private func configureFrameRate(device: AVCaptureDevice, frameRate: Int32) {
         do {
             try device.lockForConfiguration()
-            let frameDuration = CMTime(value: 1, timescale: 30)
+            let frameDuration = CMTime(value: 1, timescale: frameRate)
             device.activeVideoMinFrameDuration = frameDuration
             device.activeVideoMaxFrameDuration = frameDuration
             device.unlockForConfiguration()
