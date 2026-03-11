@@ -100,6 +100,21 @@ final class CameraManager: NSObject {
         profileLevel: kVTProfileLevel_H264_Baseline_AutoLevel,
         keyFrameInterval: 30
     ))
+    /// Latest SPS/PPS data to send to newly connected clients.
+    @ObservationIgnored private let _latestParamSets = OSAllocatedUnfairLock<Data?>(initialState: nil)
+    /// Flag to force next frame as keyframe (set when client connects).
+    @ObservationIgnored private let _forceKeyframe = OSAllocatedUnfairLock(initialState: false)
+
+    /// Force the encoder to produce a keyframe (with SPS/PPS) on the next frame.
+    /// Call this when a new client connects.
+    func requestKeyframe() {
+        _forceKeyframe.withLock { $0 = true }
+    }
+
+    /// Get the latest cached SPS/PPS Annex-B data, if available.
+    var latestParameterSets: Data? {
+        _latestParamSets.withLock { $0 }
+    }
 
     // MARK: - Lifecycle
 
@@ -304,6 +319,36 @@ final class CameraManager: NSObject {
         _encoderDimensions.withLock { $0 = (0, 0) }
     }
 
+    /// Extract SPS and PPS from format description as Annex-B data.
+    nonisolated private func extractParameterSets(from formatDesc: CMFormatDescription) -> Data? {
+        let startCode = Data([0x00, 0x00, 0x00, 0x01])
+        var paramData = Data()
+
+        // Get number of parameter sets
+        var paramCount = 0
+        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            formatDesc, parameterSetIndex: 0,
+            parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+            parameterSetCountOut: &paramCount, nalUnitHeaderLengthOut: nil
+        ) == noErr else { return nil }
+
+        // Extract each parameter set (SPS at 0, PPS at 1, etc.)
+        for i in 0..<paramCount {
+            var paramPointer: UnsafePointer<UInt8>?
+            var paramSize = 0
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                formatDesc, parameterSetIndex: i,
+                parameterSetPointerOut: &paramPointer, parameterSetSizeOut: &paramSize,
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+            ) == noErr, let paramPointer else { continue }
+
+            paramData.append(startCode)
+            paramData.append(paramPointer, count: paramSize)
+        }
+
+        return paramData.isEmpty ? nil : paramData
+    }
+
     /// Convert AVCC format (length-prefixed NALUs) to Annex-B (start code prefixed).
     /// Prepends SPS and PPS before keyframes.
     nonisolated private func extractH264AnnexB(from sampleBuffer: CMSampleBuffer) -> Data? {
@@ -318,33 +363,24 @@ final class CameraManager: NSObject {
 
         let startCode = Data([0x00, 0x00, 0x00, 0x01])
 
-        // If keyframe, prepend SPS and PPS
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+        // Detect keyframe using Swift-bridged attachments
         let isKeyframe: Bool
-        if let attachments, CFArrayGetCount(attachments) > 0 {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
-            let notSync = CFDictionaryGetValue(dict, unsafeBitCast(kCMSampleAttachmentKey_NotSync, to: UnsafeRawPointer.self))
-            isKeyframe = (notSync == nil)
+        if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+           let first = attachmentsArray.first {
+            // kCMSampleAttachmentKey_DependsOnOthers == false means keyframe
+            // kCMSampleAttachmentKey_NotSync absent means keyframe
+            let dependsOnOthers = first[kCMSampleAttachmentKey_DependsOnOthers] as? Bool ?? false
+            isKeyframe = !dependsOnOthers
         } else {
             isKeyframe = true
         }
 
+        // On keyframe, extract and prepend SPS/PPS
         if isKeyframe, let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            // SPS
-            var spsSize = 0
-            var spsCount = 0
-            var spsPointer: UnsafePointer<UInt8>?
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, parameterSetIndex: 0, parameterSetPointerOut: &spsPointer, parameterSetSizeOut: &spsSize, parameterSetCountOut: &spsCount, nalUnitHeaderLengthOut: nil) == noErr, let spsPointer {
-                result.append(startCode)
-                result.append(UnsafeBufferPointer(start: spsPointer, count: spsSize))
-            }
-
-            // PPS
-            var ppsSize = 0
-            var ppsPointer: UnsafePointer<UInt8>?
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, parameterSetIndex: 1, parameterSetPointerOut: &ppsPointer, parameterSetSizeOut: &ppsSize, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr, let ppsPointer {
-                result.append(startCode)
-                result.append(UnsafeBufferPointer(start: ppsPointer, count: ppsSize))
+            if let paramSets = extractParameterSets(from: formatDesc) {
+                result.append(paramSets)
+                // Cache for new clients
+                _latestParamSets.withLock { $0 = paramSets }
             }
         }
 
@@ -398,13 +434,24 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
+        // Check if we need to force a keyframe
+        var frameProps: CFDictionary?
+        let needsKeyframe = _forceKeyframe.withLock { val in
+            let result = val
+            val = false
+            return result
+        }
+        if needsKeyframe {
+            frameProps = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        }
+
         var flags = VTEncodeInfoFlags()
         let encodeStatus = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
             duration: .invalid,
-            frameProperties: nil,
+            frameProperties: frameProps,
             infoFlagsOut: &flags
         ) { [weak self] status, _, encodedBuffer in
             guard status == noErr, let encodedBuffer, let self else { return }

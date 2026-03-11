@@ -89,6 +89,12 @@ struct ContentView: View {
                                     camera.onH264Data = { [server] h264Data in
                                         server.broadcast(data: h264Data)
                                     }
+                                    server.onClientConnected = { [camera] in
+                                        camera.requestKeyframe()
+                                    }
+                                    server.initialDataForClient = { [camera] in
+                                        camera.latestParameterSets
+                                    }
                                     camera.start()
                                     server.start()
                                     UIApplication.shared.isIdleTimerDisabled = true

@@ -25,6 +25,11 @@ final class StreamServer {
     @ObservationIgnored nonisolated(unsafe) private var connections: [NWConnection] = []
     private let connectionsLock = NSLock()
 
+    /// Called when a new client connects — use to force a keyframe.
+    @ObservationIgnored nonisolated(unsafe) var onClientConnected: (() -> Void)?
+    /// Provides initial data (SPS/PPS) to send to a new client.
+    @ObservationIgnored nonisolated(unsafe) var initialDataForClient: (() -> Data?)?
+
     private let htmlPage = Data("""
         <!DOCTYPE html>
         <html><head><title>LinuxCam</title>
@@ -189,7 +194,13 @@ final class StreamServer {
     private func startH264Stream(on connection: NWConnection) {
         let header = "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
 
-        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
+        // Build initial payload: HTTP header + cached SPS/PPS if available
+        var initialPayload = Data(header.utf8)
+        if let paramSets = initialDataForClient?() {
+            initialPayload.append(paramSets)
+        }
+
+        connection.send(content: initialPayload, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if let error {
                 print("[StreamServer] Failed to send stream header: \(error)")
@@ -198,6 +209,8 @@ final class StreamServer {
             }
 
             self.addConnection(connection)
+            // Request a keyframe so the new client gets SPS/PPS + IDR immediately
+            self.onClientConnected?()
         })
     }
 
